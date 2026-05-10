@@ -228,6 +228,25 @@ export interface GroupUsers {
   userId: string;
 }
 
+export interface PageTransclusionReferences {
+  createdAt: Generated<Timestamp>;
+  transclusionId: string;
+  referencePageId: string;
+  id: Generated<string>;
+  sourcePageId: string;
+  workspaceId: string;
+}
+
+export interface PageTransclusions {
+  content: Json;
+  createdAt: Generated<Timestamp>;
+  transclusionId: string;
+  id: Generated<string>;
+  pageId: string;
+  updatedAt: Generated<Timestamp>;
+  workspaceId: string;
+}
+
 export interface PageHistory {
   content: Json | null;
   contributorIds: Generated<string[] | null>;
@@ -440,6 +459,15 @@ export interface Watchers {
   createdAt: Generated<Timestamp>;
 }
 
+export interface Labels {
+  id: Generated<string>;
+  name: string;
+  type: Generated<string>;
+  workspaceId: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+}
+
 export interface PageAccess {
   id: Generated<string>;
   pageId: string;
@@ -449,6 +477,13 @@ export interface PageAccess {
   creatorId: string | null;
   createdAt: Generated<Timestamp>;
   updatedAt: Generated<Timestamp>;
+}
+
+export interface PageLabels {
+  id: Generated<string>;
+  pageId: string;
+  labelId: string;
+  createdAt: Generated<Timestamp>;
 }
 
 export interface PagePermissions {
@@ -569,10 +604,14 @@ export interface DB {
   fileTasks: FileTasks;
   groups: Groups;
   groupUsers: GroupUsers;
+  labels: Labels;
   notifications: Notifications;
   pageAccess: PageAccess;
+  pageTransclusionReferences: PageTransclusionReferences;
+  pageTransclusions: PageTransclusions;
   pagePermissions: PagePermissions;
   pageHistory: PageHistory;
+  pageLabels: PageLabels;
   pageVerifications: PageVerifications;
   pageVerifiers: PageVerifiers;
   pages: Pages;

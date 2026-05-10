@@ -81,11 +81,7 @@ export default function GlobalAppShell({
   const showGlobalSidebar = !isSpaceRoute && !isSettingsRoute && !isAiRoute;
 
   return (
-    <>
-      <a href="#main-content" className={classes.skipLink}>
-        {t("Skip to main content")}
-      </a>
-      <AppShell
+    <AppShell
       header={{ height: 45 }}
       navbar={{
         width: isSpaceRoute ? sidebarWidth : 300,
@@ -151,13 +147,14 @@ export default function GlobalAppShell({
                 ? t("Table of contents")
                 : asideTab === "chat"
                   ? t("AI Chat")
-                  : undefined
+                  : asideTab === "details"
+                    ? t("Details")
+                    : undefined
           }
         >
           <Aside />
         </AppShell.Aside>
       )}
     </AppShell>
-    </>
   );
 }
