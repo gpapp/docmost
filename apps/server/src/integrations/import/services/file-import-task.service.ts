@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import * as path from 'path';
 import { jsonToText } from '../../../collaboration/collaboration.util';
 import { InjectKysely } from 'nestjs-kysely';
@@ -24,6 +24,9 @@ import { formatImportHtml } from '../utils/import-formatter';
 import {
   buildAttachmentCandidates,
   collectMarkdownAndHtmlFiles,
+  encodeFilePath,
+  extractNotionPartialId,
+  readDocmostMetadata,
   stripNotionID,
 } from '../utils/import.utils';
 import { executeTx } from '@docmost/db/utils';
@@ -34,7 +37,11 @@ import { PageService } from '../../../core/page/services/page.service';
 import { ImportPageNode } from '../dto/file-task-dto';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { EventName } from '../../../common/events/event.contants';
-import pLimit from 'p-limit';
+import { AuditEvent, AuditResource } from '../../../common/events/audit-events';
+import {
+  AUDIT_SERVICE,
+  IAuditService,
+} from '../../../integrations/audit/audit.service';
 
 @Injectable()
 export class FileImportTaskService {
@@ -49,18 +56,15 @@ export class FileImportTaskService {
     private readonly importAttachmentService: ImportAttachmentService,
     private moduleRef: ModuleRef,
     private eventEmitter: EventEmitter2,
-  ) { }
+    @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
+  ) {}
 
-  async getFileTask(fileTaskId: string): Promise<FileTask | undefined> {
-    return await this.db
+  async processZIpImport(fileTaskId: string): Promise<void> {
+    const fileTask = await this.db
       .selectFrom('fileTasks')
       .selectAll()
       .where('id', '=', fileTaskId)
       .executeTakeFirst();
-  }
-
-  async processZipImport(fileTaskId: string): Promise<void> {
-    const fileTask = await this.getFileTask(fileTaskId);
 
     if (!fileTask) {
       this.logger.log(`Import file task with ID ${fileTaskId} not found`);
@@ -92,9 +96,7 @@ export class FileImportTaskService {
         fileTask.filePath,
       );
       await pipeline(fileStream, createWriteStream(tmpZipPath));
-      await this.updateTaskProgress(fileTaskId, 5);
       await extractZip(tmpZipPath, tmpExtractDir);
-      await this.updateTaskProgress(fileTaskId, 10);
     } catch (err) {
       await cleanupTmpFile();
       await cleanupTmpDir();
@@ -159,8 +161,16 @@ export class FileImportTaskService {
     fileTask: FileTask;
   }): Promise<void> {
     const { extractDir, fileTask } = opts;
+    const isNotion = fileTask.source === FileImportSource.Notion;
     const allFiles = await collectMarkdownAndHtmlFiles(extractDir);
     const attachmentCandidates = await buildAttachmentCandidates(extractDir);
+    const docmostMetadata = await readDocmostMetadata(extractDir);
+
+    const space = await this.db
+      .selectFrom('spaces')
+      .select(['slug'])
+      .where('id', '=', fileTask.spaceId)
+      .executeTakeFirst();
 
     const pagesMap = new Map<string, ImportPageNode>();
 
@@ -171,6 +181,9 @@ export class FileImportTaskService {
         .join('/'); // normalize to forward-slashes
       const ext = path.extname(relPath).toLowerCase();
 
+      const encodedPath = encodeFilePath(relPath);
+      const pageMetadata = docmostMetadata?.pages[encodedPath];
+
       pagesMap.set(relPath, {
         id: v7(),
         slugId: generateSlugId(),
@@ -179,6 +192,7 @@ export class FileImportTaskService {
         parentPageId: null,
         fileExtension: ext,
         filePath: relPath,
+        icon: pageMetadata?.icon ?? null,
       });
     }
 
@@ -218,7 +232,17 @@ export class FileImportTaskService {
     }
 
     // For each folder with content, create a placeholder page if no corresponding .md or .html exists
-    foldersWithContent.forEach((folderPath) => {
+    // Process folders with partial UUIDs first so they claim their specific files
+    // before plain folders (without partial UUIDs) take whatever remains.
+    const sortedFolders = isNotion
+      ? [...foldersWithContent].sort((a, b) => {
+          const aHasPartial = extractNotionPartialId(path.basename(a)) ? 0 : 1;
+          const bHasPartial = extractNotionPartialId(path.basename(b)) ? 0 : 1;
+          return aHasPartial - bHasPartial;
+        })
+      : [...foldersWithContent];
+
+    sortedFolders.forEach((folderPath) => {
       if (
         skipRootFolder &&
         folderPath?.toLowerCase() === skipRootFolder?.toLowerCase()
@@ -231,15 +255,54 @@ export class FileImportTaskService {
 
       if (!pagesMap.has(mdPath) && !pagesMap.has(htmlPath)) {
         const folderName = path.basename(folderPath);
-        pagesMap.set(mdPath, {
-          id: v7(),
-          slugId: generateSlugId(),
-          name: stripNotionID(folderName),
-          content: '',
-          parentPageId: null,
-          fileExtension: '.md',
-          filePath: mdPath,
-        });
+        const parentDir = path.dirname(folderPath);
+
+        // Notion no longer adds UUIDs to folder names, but still adds them to files.
+        // For duplicate names, Notion adds a partial UUID "{first4}-{last4}" to the folder.
+        let matched = false;
+        if (isNotion) {
+          const partialId = extractNotionPartialId(folderName);
+          const strippedFolderName = stripNotionID(folderName);
+          const isSameDir = (fileDir: string) =>
+            fileDir === parentDir || (parentDir === '.' && !fileDir.includes('/'));
+
+          for (const [filePath, page] of pagesMap.entries()) {
+            if (!isSameDir(path.dirname(filePath))) continue;
+            if (page.name !== strippedFolderName) continue;
+
+            if (partialId) {
+              // Match partial UUID against the full UUID in the filename
+              const fileBase = path.basename(filePath, path.extname(filePath));
+              const fullIdMatch = fileBase.match(/[a-f0-9]{32}$/i);
+              if (!fullIdMatch) continue;
+              const fullId = fullIdMatch[0].toLowerCase();
+              if (!fullId.startsWith(partialId.prefix) || !fullId.endsWith(partialId.suffix)) {
+                continue;
+              }
+            }
+
+            pagesMap.delete(filePath);
+            page.filePath = mdPath;
+            pagesMap.set(mdPath, page);
+            matched = true;
+            break;
+          }
+        }
+
+        if (!matched) {
+          const encodedMdPath = encodeFilePath(mdPath);
+          const placeholderMetadata = docmostMetadata?.pages[encodedMdPath];
+          pagesMap.set(mdPath, {
+            id: v7(),
+            slugId: generateSlugId(),
+            name: stripNotionID(folderName),
+            content: '',
+            parentPageId: null,
+            fileExtension: '.md',
+            filePath: mdPath,
+            icon: placeholderMetadata?.icon ?? null,
+          });
+        }
       }
     });
 
@@ -273,11 +336,39 @@ export class FileImportTaskService {
       siblingsMap.set(page.parentPageId, group);
     });
 
+    const encodedPathsMap = new Map<string, string>();
+    if (docmostMetadata) {
+      pagesMap.forEach((_, filePath) => {
+        encodedPathsMap.set(filePath, encodeFilePath(filePath));
+      });
+    }
+
+    // Sort siblings by metadata position if available, otherwise alphabetically
+    const sortSiblings = (siblings: ImportPageNode[]) => {
+      if (docmostMetadata) {
+        siblings.sort((a, b) => {
+          const posA =
+            docmostMetadata.pages[encodedPathsMap.get(a.filePath)]?.position;
+          const posB =
+            docmostMetadata.pages[encodedPathsMap.get(b.filePath)]?.position;
+          if (posA && posB) {
+            // Use direct comparison to match PostgreSQL collation 'C' (byte order)
+            if (posA < posB) return -1;
+            if (posA > posB) return 1;
+            return 0;
+          }
+          return a.name.localeCompare(b.name);
+        });
+      } else {
+        siblings.sort((a, b) => a.name.localeCompare(b.name));
+      }
+    };
+
     // get root pages
     const rootSibs = siblingsMap.get(null);
 
     if (rootSibs?.length) {
-      rootSibs.sort((a, b) => a.name.localeCompare(b.name));
+      sortSiblings(rootSibs);
 
       // get first position key from the server
       const nextPosition = await this.pageService.nextPagePosition(
@@ -299,7 +390,7 @@ export class FileImportTaskService {
     siblingsMap.forEach((sibs, parentId) => {
       if (parentId === null) return; // root already done
 
-      sibs.sort((a, b) => a.name.localeCompare(b.name));
+      sortSiblings(sibs);
 
       let prevPos: string | null = null;
       for (const page of sibs) {
@@ -371,21 +462,19 @@ export class FileImportTaskService {
     // Process pages level by level sequentially to respect foreign key constraints
     const allBacklinks: any[] = [];
     const validPageIds = new Set<string>();
+    const pageTitles = new Map<string, string>();
     let totalPagesProcessed = 0;
 
     // Sort levels to process in order
     const sortedLevels = Array.from(pagesByLevel.keys()).sort((a, b) => a - b);
-    const preparedPagesByLevel = new Map<number, InsertablePage[]>();
 
     try {
-      const processingLimit = pLimit(5); // Process up to 5 pages concurrently
+      await executeTx(this.db, async (trx) => {
+        // Process pages level by level sequentially within the transaction
+        for (const level of sortedLevels) {
+          const levelPages = pagesByLevel.get(level)!;
 
-      for (const level of sortedLevels) {
-        const levelPages = pagesByLevel.get(level)!;
-        const levelPreparedPages: InsertablePage[] = [];
-
-        const tasks = levelPages.map(([filePath, page]) =>
-          processingLimit(async () => {
+          for (const [filePath, page] of levelPages) {
             const absPath = path.join(extractDir, filePath);
             let content = '';
 
@@ -423,6 +512,7 @@ export class FileImportTaskService {
               creatorId: fileTask.creatorId,
               sourcePageId: page.id,
               workspaceId: fileTask.workspaceId,
+              spaceSlug: space?.slug,
             });
 
             const pmState = getProsemirrorContent(
@@ -436,7 +526,7 @@ export class FileImportTaskService {
               id: page.id,
               slugId: page.slugId,
               title: title || page.name,
-              icon: pageIcon || null,
+              icon: page.icon || pageIcon || null,
               content: prosemirrorJson,
               textContent: jsonToText(prosemirrorJson),
               ydoc: await this.importService.createYdoc(prosemirrorJson),
@@ -448,36 +538,17 @@ export class FileImportTaskService {
               parentPageId: page.parentPageId,
             };
 
-            levelPreparedPages.push(insertablePage);
+            await trx.insertInto('pages').values(insertablePage).execute();
+
+            // Track valid page IDs, titles, and collect backlinks
+            validPageIds.add(insertablePage.id);
+            pageTitles.set(insertablePage.id, insertablePage.title);
             allBacklinks.push(...backlinks);
             totalPagesProcessed++;
 
-            const totalPages = pagesMap.size;
-            // Update DB progress (mapping 10% - 95% for page processing)
-            const progress = Math.min(
-              10 + Math.round((totalPagesProcessed / totalPages) * 85),
-              95,
-            );
-            await this.updateTaskProgress(fileTask.id, progress);
-          }),
-        );
-
-        await Promise.all(tasks);
-        preparedPagesByLevel.set(level, levelPreparedPages);
-      }
-
-      await executeTx(this.db, async (trx) => {
-        // Insert prepared pages level by level within the transaction
-        for (const level of sortedLevels) {
-          const levelPages = preparedPagesByLevel.get(level) || [];
-
-          // Batch insert pages for this level
-          if (levelPages.length > 0) {
-            const PAGE_BATCH_SIZE = 50;
-            for (let i = 0; i < levelPages.length; i += PAGE_BATCH_SIZE) {
-              const chunk = levelPages.slice(i, i + PAGE_BATCH_SIZE);
-              await trx.insertInto('pages').values(chunk).execute();
-              chunk.forEach((p) => validPageIds.add(p.id));
+            // Log progress periodically
+            if (totalPagesProcessed % 50 === 0) {
+              this.logger.debug(`Processed ${totalPagesProcessed} pages...`);
             }
           }
         }
@@ -514,10 +585,38 @@ export class FileImportTaskService {
           `Successfully imported ${totalPagesProcessed} pages with ${filteredBacklinks.length} backlinks`,
         );
       });
+
+      if (validPageIds.size > 0) {
+        const auditPayloads = Array.from(validPageIds).map((pageId) => ({
+          event: AuditEvent.PAGE_CREATED,
+          resourceType: AuditResource.PAGE,
+          resourceId: pageId,
+          spaceId: fileTask.spaceId,
+          metadata: {
+            source: fileTask.source,
+            fileTaskId: fileTask.id,
+            title: pageTitles.get(pageId),
+          },
+        }));
+
+        this.auditService.logBatchWithContext(auditPayloads, {
+          workspaceId: fileTask.workspaceId,
+          actorId: fileTask.creatorId,
+          actorType: 'user',
+        });
+      }
     } catch (error) {
       this.logger.error('Failed to import files:', error);
       throw new Error(`File import failed: ${error?.['message']}`);
     }
+  }
+
+  async getFileTask(fileTaskId: string) {
+    return this.db
+      .selectFrom('fileTasks')
+      .selectAll()
+      .where('id', '=', fileTaskId)
+      .executeTakeFirst();
   }
 
   async updateTaskStatus(
@@ -528,24 +627,7 @@ export class FileImportTaskService {
     try {
       await this.db
         .updateTable('fileTasks')
-        .set({
-          status: status,
-          errorMessage,
-          progress: status === FileTaskStatus.Success ? 100 : undefined,
-          updatedAt: new Date(),
-        })
-        .where('id', '=', fileTaskId)
-        .execute();
-    } catch (err) {
-      this.logger.error(err);
-    }
-  }
-
-  async updateTaskProgress(fileTaskId: string, progress: number) {
-    try {
-      await this.db
-        .updateTable('fileTasks')
-        .set({ progress, updatedAt: new Date() })
+        .set({ status: status, errorMessage, updatedAt: new Date() })
         .where('id', '=', fileTaskId)
         .execute();
     } catch (err) {

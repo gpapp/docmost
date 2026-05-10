@@ -1,7 +1,6 @@
-import { BadRequestException, NotFoundException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { MultipartFile } from '@fastify/multipart';
-import { sanitize } from 'sanitize-filename-ts';
 import * as path from 'path';
 import {
   htmlToJson,
@@ -10,7 +9,11 @@ import {
 } from '../../../collaboration/collaboration.util';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
-import { generateSlugId, sanitizeFileName, createByteCountingStream } from '../../../common/helpers';
+import {
+  generateSlugId,
+  sanitizeFileName,
+  createByteCountingStream,
+} from '../../../common/helpers';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import * as Y from 'yjs';
@@ -25,6 +28,9 @@ import { StorageService } from '../../storage/storage.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QueueJob, QueueName } from '../../queue/constants';
+import { ModuleRef } from '@nestjs/core';
+import { load } from 'cheerio';
+import { normalizeImportHtml } from '../utils/import-formatter';
 
 @Injectable()
 export class ImportService {
@@ -36,32 +42,53 @@ export class ImportService {
     @InjectKysely() private readonly db: KyselyDB,
     @InjectQueue(QueueName.FILE_TASK_QUEUE)
     private readonly fileTaskQueue: Queue,
-  ) { }
+    private moduleRef: ModuleRef,
+  ) {}
 
   async importPage(
     filePromise: Promise<MultipartFile>,
     userId: string,
     spaceId: string,
     workspaceId: string,
-    parentPageId?: string,
-    title?: string,
-  ): Promise<{ id: string; slugId: string } | null> {
+  ) {
     const file = await filePromise;
     const fileBuffer = await file.toBuffer();
     const fileExtension = path.extname(file.filename).toLowerCase();
-    const fileName = sanitize(
-      path.basename(file.filename, fileExtension).slice(0, 255),
+    const fileName = sanitizeFileName(
+      path.basename(file.filename, fileExtension),
     );
     const fileContent = fileBuffer.toString();
 
     let prosemirrorState = null;
     let createdPage = null;
 
+    // For DOCX, we need the page ID upfront so images can reference it
+    const pageId =
+      fileExtension === '.docx' || fileExtension === '.pdf'
+        ? uuid7()
+        : undefined;
+
     try {
       if (fileExtension.endsWith('.md')) {
         prosemirrorState = await this.processMarkdown(fileContent);
       } else if (fileExtension.endsWith('.html')) {
         prosemirrorState = await this.processHTML(fileContent);
+      } else if (fileExtension.endsWith('.docx')) {
+        prosemirrorState = await this.processDocx(
+          fileBuffer,
+          workspaceId,
+          spaceId,
+          pageId,
+          userId,
+        );
+      } else if (fileExtension.endsWith('.pdf')) {
+        prosemirrorState = await this.processPdf(
+          fileBuffer,
+          workspaceId,
+          spaceId,
+          pageId,
+          userId,
+        );
       }
     } catch (err) {
       const message = 'Error processing file content';
@@ -75,32 +102,17 @@ export class ImportService {
       throw new BadRequestException(message);
     }
 
-    let contentTitle;
-    let prosemirrorJson;
-    if (title == null || title === "") {
-      const { title: extractedTitle, prosemirrorJson: normalizedJson } =
-        this.extractTitleAndRemoveHeading(prosemirrorState);
-      contentTitle = extractedTitle;
-      prosemirrorJson = normalizedJson;
-    } else {
-      contentTitle = title;
-      prosemirrorJson = prosemirrorState;
-    }
+    const { title, prosemirrorJson } =
+      this.extractTitleAndRemoveHeading(prosemirrorState);
 
-    const pageTitle = contentTitle || fileName;
+    const pageTitle = title || fileName;
 
     if (prosemirrorJson) {
-      if (parentPageId) {
-        const parentPage = await this.pageRepo.findById(parentPageId);
-        if (!parentPage || parentPage.spaceId !== spaceId) {
-          throw new NotFoundException('Parent page not found');
-        }
-      }
-
       try {
-        const pagePosition = await this.getNewPagePosition(spaceId, parentPageId);
+        const pagePosition = await this.getNewPagePosition(spaceId);
 
         createdPage = await this.pageRepo.insertPage({
+          ...(pageId ? { id: pageId } : {}),
           slugId: generateSlugId(),
           title: pageTitle,
           content: prosemirrorJson,
@@ -111,11 +123,10 @@ export class ImportService {
           creatorId: userId,
           workspaceId: workspaceId,
           lastUpdatedById: userId,
-          parentPageId: parentPageId ?? null,
         });
 
         this.logger.debug(
-          `Successfully imported "${file.filename}". ID: ${createdPage.id} - SlugId: ${createdPage.slugId}`,
+          `Successfully imported "${title}${fileExtension}. ID: ${createdPage.id} - SlugId: ${createdPage.slugId}"`,
         );
       } catch (err) {
         const message = 'Failed to create imported page';
@@ -124,7 +135,7 @@ export class ImportService {
       }
     }
 
-    return createdPage ? { id: createdPage.id, slugId: createdPage.slugId } : null;
+    return createdPage;
   }
 
   async processMarkdown(markdownInput: string): Promise<any> {
@@ -138,10 +149,84 @@ export class ImportService {
 
   async processHTML(htmlInput: string): Promise<any> {
     try {
-      return htmlToJson(htmlInput);
+      const $ = load(htmlInput);
+      normalizeImportHtml($, $.root());
+      return htmlToJson($.html() || '');
     } catch (err) {
       throw err;
     }
+  }
+
+  async processDocx(
+    fileBuffer: Buffer,
+    workspaceId: string,
+    spaceId: string,
+    pageId: string,
+    userId: string,
+  ): Promise<any> {
+    let DocxImportModule: any;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      DocxImportModule = require('./../../../ee/document-import/docx-import.service');
+    } catch (err) {
+      this.logger.error(
+        'DOCX import requested but EE module not bundled in this build',
+      );
+      throw new BadRequestException(
+        'This feature requires a valid enterprise license.',
+      );
+    }
+
+    const docxImportService = this.moduleRef.get(
+      DocxImportModule.DocxImportService,
+      { strict: false },
+    );
+
+    const html = await docxImportService.convertDocxToHtml(
+      fileBuffer,
+      workspaceId,
+      spaceId,
+      pageId,
+      userId,
+    );
+
+    return this.processHTML(html);
+  }
+
+  async processPdf(
+    fileBuffer: Buffer,
+    workspaceId: string,
+    spaceId: string,
+    pageId: string,
+    userId: string,
+  ): Promise<any> {
+    let PdfImportModule: any;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      PdfImportModule = require('./../../../ee/document-import/pdf-import.service');
+    } catch (err) {
+      this.logger.error(
+        'PDF import requested but EE module not bundled in this build',
+      );
+      throw new BadRequestException(
+        'This feature requires a valid enterprise license.',
+      );
+    }
+
+    const pdfImportService = this.moduleRef.get(
+      PdfImportModule.PdfImportService,
+      { strict: false },
+    );
+
+    const html = await pdfImportService.convertPdfToHtml(
+      fileBuffer,
+      workspaceId,
+      spaceId,
+      pageId,
+      userId,
+    );
+
+    return this.processHTML(html);
   }
 
   async createYdoc(prosemirrorJson: any): Promise<Buffer | null> {
@@ -226,13 +311,10 @@ export class ImportService {
     workspaceId: string,
   ) {
     const file = await filePromise;
-    // const fileBuffer = await file.toBuffer();
     const fileExtension = path.extname(file.filename).toLowerCase();
     const fileName = sanitizeFileName(
       path.basename(file.filename, fileExtension),
     );
-    // const fileSize = fileBuffer.length; // Removed to avoid RangeError
-
     const fileNameWithExt = fileName + fileExtension;
 
     const fileTaskId = uuid7();
@@ -241,7 +323,6 @@ export class ImportService {
     // upload file
     const { stream, getBytesRead } = createByteCountingStream(file.file);
 
-    // upload file
     await this.storageService.upload(filePath, stream);
 
     const fileSize = getBytesRead();

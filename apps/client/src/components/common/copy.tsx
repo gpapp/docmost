@@ -1,12 +1,15 @@
-import { ActionIcon, CopyButton, Tooltip } from "@mantine/core";
+import { ActionIcon, MantineColor, MantineSize, Tooltip } from "@mantine/core";
+import { CopyButton } from "@/components/common/copy-button";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import React from "react";
 import { useTranslation } from "react-i18next";
 
 interface CopyProps {
   text: string;
+  size?: MantineSize;
+  color?: MantineColor;
 }
-export default function CopyTextButton({ text }: CopyProps) {
+export default function CopyTextButton({ text, size }: CopyProps) {
   const { t } = useTranslation();
 
   return (
@@ -21,6 +24,8 @@ export default function CopyTextButton({ text }: CopyProps) {
             color={copied ? "teal" : "gray"}
             variant="subtle"
             onClick={copy}
+            size={size}
+            aria-label={copied ? t("Copied") : t("Copy")}
           >
             {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
           </ActionIcon>

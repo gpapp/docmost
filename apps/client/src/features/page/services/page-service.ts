@@ -72,22 +72,19 @@ export async function getSidebarPages(
 export async function getAllSidebarPages(
   params: SidebarPagesParams,
 ): Promise<InfiniteData<IPagination<IPage>, unknown>> {
-  let page = 1;
-  let hasNextPage = false;
+  let cursor: string | undefined = undefined;
   const pages: IPagination<IPage>[] = [];
-  const pageParams: number[] = [];
+  const pageParams: (string | undefined)[] = [];
 
   do {
-    const req = await api.post("/pages/sidebar-pages", { ...params, page: page });
+    const req = await api.post("/pages/sidebar-pages", { ...params, cursor, limit: 100 });
 
     const data: IPagination<IPage> = req.data;
     pages.push(data);
-    pageParams.push(page);
+    pageParams.push(cursor);
 
-    hasNextPage = data.meta.hasNextPage;
-
-    page += 1;
-  } while (hasNextPage);
+    cursor = data.meta.nextCursor ?? undefined;
+  } while (cursor);
 
   return {
     pageParams,
@@ -103,9 +100,16 @@ export async function getPageBreadcrumbs(
 }
 
 export async function getRecentChanges(
-  spaceId?: string,
+  params?: QueryParams & { spaceId?: string },
 ): Promise<IPagination<IPage>> {
-  const req = await api.post("/pages/recent", { spaceId });
+  const req = await api.post("/pages/recent", params);
+  return req.data;
+}
+
+export async function getCreatedByPages(
+  params?: QueryParams & { userId?: string; spaceId?: string },
+): Promise<IPagination<IPage>> {
+  const req = await api.post("/pages/created-by-user", params);
   return req.data;
 }
 
@@ -163,6 +167,15 @@ export async function importZip(
     onUploadProgress,
   });
 
+  return req.data;
+}
+
+export async function getAttachmentInfo(
+  attachmentId: string,
+): Promise<IAttachment> {
+  const req = await api.post<IAttachment>("/files/info", {
+    attachmentId,
+  });
   return req.data;
 }
 

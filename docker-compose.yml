@@ -2,53 +2,32 @@ services:
   docmost:
     image: docmost/docmost:latest
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      - db
+      - redis
     environment:
-      X_APP_URL: '${APP_URL:-http://localhost:3000}'
-      APP_SECRET: '${APP_SECRET}'
-
-      DATABASE_URL: 'postgresql://${POSTGRES_USER:-docmost}:${POSTGRES_PASSWORD_URLENCODE:-docmost}@db:5432/${POSTGRES_DB:-docmost}?schema=public'
+      APP_URL: 'http://localhost:3000'
+      APP_SECRET: 'REPLACE_WITH_LONG_SECRET'
+      DATABASE_URL: 'postgresql://docmost:STRONG_DB_PASSWORD@db:5432/docmost'
       REDIS_URL: 'redis://redis:6379'
-
-      MAIL_DRIVER: ${MAIL_DRIVER}
-      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS}
-      MAIL_FROM_NAME: ${MAIL_FROM_NAME}
-
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      SMTP_USERNAME: ${SMTP_USERNAME}
-      SMTP_PASSWORD: ${SMTP_PASSWORD}
-      SMTP_SECURE: ${SMTP_SECURE}
-
-      FILE_UPLOAD_SIZE_LIMIT: '100mb'
-      FILE_IMPORT_SIZE_LIMIT: '5gb'
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "3000:3000"
     restart: unless-stopped
     volumes:
       - docmost:/app/data/storage
 
   db:
-    image: postgres:16-alpine
+    image: postgres:18
     environment:
-      POSTGRES_DB: "${POSTGRES_DB:-docmost}"
-      POSTGRES_USER: "${POSTGRES_USER:-docmost}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-docmost}"
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docmost} -d ${POSTGRES_DB:-docmost}" ]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 90s # Gives Postgres time to create the initial DB files
+      POSTGRES_DB: docmost
+      POSTGRES_USER: docmost
+      POSTGRES_PASSWORD: STRONG_DB_PASSWORD
     restart: unless-stopped
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - db_data:/var/lib/postgresql
 
   redis:
-    image: redis:7.2-alpine
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
     volumes:
       - redis_data:/data

@@ -1,7 +1,8 @@
 import * as path from 'path';
 import * as bcrypt from 'bcrypt';
-import { sanitize } from 'sanitize-filename-ts';
+import sanitize = require('sanitize-filename');
 import { FastifyRequest } from 'fastify';
+import { Readable, Transform } from 'stream';
 
 export const envPath = path.resolve(process.cwd(), '..', '..', '.env');
 
@@ -71,11 +72,33 @@ export function extractDateFromUuid7(uuid7: string) {
   return new Date(timestamp);
 }
 
-export function sanitizeFileName(fileName: string): string {
-  const sanitizedFilename = sanitize(fileName)
-    .replace(/ /g, '_')
-    .replace(/#/g, '_');
-  return sanitizedFilename.slice(0, 255);
+export type SanitizeFileNameOptions = {
+  /** Keep spaces and `#` instead of replacing them with `_`. Useful for
+   * download filenames where readability matters. Defaults to false. */
+  preserveSpaces?: boolean;
+};
+
+export function sanitizeFileName(
+  fileName: string,
+  options: SanitizeFileNameOptions = {},
+): string {
+  // Decode percent-encoded sequences so that bypasses like "..%2F" reach
+  // sanitize() as literal "../" and get stripped. sanitize-filename only
+  // strips literal characters and won't catch encoded path separators
+  // on its own.
+  const decoded = fileName.replace(/%[0-9a-fA-F]{2}/g, (m) => {
+    try {
+      return decodeURIComponent(m);
+    } catch {
+      return m;
+    }
+  });
+
+  const sanitized = sanitize(decoded);
+  if (options.preserveSpaces) {
+    return sanitized;
+  }
+  return sanitized.replace(/ /g, '_').replace(/#/g, '_');
 }
 
 export function removeAccent(str: string): string {
@@ -87,16 +110,85 @@ export function extractBearerTokenFromHeader(
   request: FastifyRequest,
 ): string | undefined {
   const [type, token] = request.headers.authorization?.split(' ') ?? [];
-  return type === 'Bearer' ? token : undefined;
+  return type?.toLowerCase() === 'bearer' ? token : undefined;
 }
 
-export function hasLicenseOrEE(opts: {
-  licenseKey: string;
-  plan: string;
-  isCloud: boolean;
+/**
+ * Normalizes a database URL for postgres.js compatibility.
+ * - Removes `sslmode=no-verify` (not supported by postgres.js), keeps other sslmode values
+ * - Removes `schema` parameter (has no effect via connection string)
+ * Note: If we don't strip them, the connection will fail
+ */
+export function normalizePostgresUrl(url: string): string {
+  const parsed = new URL(url);
+  const newParams = new URLSearchParams();
+
+  for (const [key, value] of parsed.searchParams) {
+    if (key === 'sslmode' && value === 'no-verify') continue;
+    if (key === 'schema') continue;
+    newParams.append(key, value);
+  }
+
+  parsed.search = newParams.toString();
+  return parsed.toString();
+}
+
+export function diffAuditTrackedFields(
+  fields: readonly string[],
+  dto: Record<string, any>,
+  before: Record<string, any> | undefined | null,
+  after: Record<string, any> | undefined | null,
+): { before: Record<string, any>; after: Record<string, any> } | null {
+  const beforeDiff: Record<string, any> = {};
+  const afterDiff: Record<string, any> = {};
+  let hasChanges = false;
+
+  for (const field of fields) {
+    if (typeof dto[field] === 'undefined') continue;
+    const oldVal = JSON.stringify(before?.[field] ?? null);
+    const newVal = JSON.stringify(after?.[field] ?? null);
+    if (oldVal !== newVal) {
+      beforeDiff[field] = before?.[field];
+      afterDiff[field] = after?.[field];
+      hasChanges = true;
+    }
+  }
+
+  return hasChanges ? { before: beforeDiff, after: afterDiff } : null;
+}
+
+export function isUserDisabled(user: {
+  deactivatedAt?: Date | null;
+  deletedAt?: Date | null;
 }): boolean {
-  const { licenseKey, plan, isCloud } = opts;
-  return Boolean(licenseKey) || (isCloud && plan === 'business');
+  return !!(user.deactivatedAt || user.deletedAt);
+}
+
+const SENSITIVE_URL_PREFIXES = ['/api/sso/'];
+
+export function redactSensitiveUrl(url: string): string {
+  if (url && SENSITIVE_URL_PREFIXES.some((prefix) => url.includes(prefix))) {
+    const qsIndex = url.indexOf('?');
+    if (qsIndex !== -1) {
+      return url.substring(0, qsIndex);
+    }
+  }
+  return url;
+}
+
+export function createByteCountingStream(source: Readable) {
+  let bytesRead = 0;
+  const stream = new Transform({
+    transform(chunk, encoding, callback) {
+      bytesRead += chunk.length;
+      callback(null, chunk);
+    },
+  });
+
+  source.pipe(stream);
+  source.on('error', (err) => stream.emit('error', err));
+
+  return { stream, getBytesRead: () => bytesRead };
 }
 
 import { Readable, Transform } from 'stream';

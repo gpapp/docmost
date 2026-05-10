@@ -1,28 +1,28 @@
-import { ActionIcon, Group, Menu, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Group, Menu, Text, ThemeIcon, Tooltip } from "@mantine/core";
 import {
   IconArrowRight,
   IconArrowsHorizontal,
   IconDots,
+  IconEye,
+  IconEyeOff,
   IconFileExport,
   IconHistory,
   IconLink,
   IconList,
+  IconMarkdown,
   IconMessage,
   IconPrinter,
-  IconSearch,
+  IconStar,
+  IconStarFilled,
   IconTrash,
   IconWifiOff,
 } from "@tabler/icons-react";
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import useToggleAside from "@/hooks/use-toggle-aside.tsx";
-import { useAtom } from "jotai";
+import { useAtom, useAtomValue } from "jotai";
 import { historyAtoms } from "@/features/page-history/atoms/history-atoms.ts";
-import {
-  getHotkeyHandler,
-  useClipboard,
-  useDisclosure,
-  useHotkeys,
-} from "@mantine/hooks";
+import { useDisclosure, useHotkeys } from "@mantine/hooks";
+import { useClipboard } from "@/hooks/use-clipboard";
 import { useParams } from "react-router-dom";
 import { usePageQuery } from "@/features/page/queries/page-query.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
@@ -34,16 +34,30 @@ import { useDeletePageModal } from "@/features/page/hooks/use-delete-page-modal.
 import { PageWidthToggle } from "@/features/user/components/page-width-pref.tsx";
 import { Trans, useTranslation } from "react-i18next";
 import ExportModal from "@/components/common/export-modal";
+import { htmlToMarkdown } from "@docmost/editor-ext";
 import {
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms.ts";
-import { searchAndReplaceStateAtom } from "@/features/editor/components/search-and-replace/atoms/search-and-replace-state-atom.ts";
-import { formattedDate, timeAgo } from "@/lib/time.ts";
+import { formattedDate } from "@/lib/time.ts";
 import { PageStateSegmentedControl } from "@/features/user/components/page-state-pref.tsx";
 import MovePageModal from "@/features/page/components/move-page-modal.tsx";
 import { useTimeAgo } from "@/hooks/use-time-ago.tsx";
-import ShareModal from "@/features/share/components/share-modal.tsx";
+import { PageShareModal } from "@/ee/page-permission";
+import {
+  PageVerificationMenuItem,
+  PageVerificationModal,
+} from "@/ee/page-verification";
+import {
+  useFavoriteIds,
+  useAddFavoriteMutation,
+  useRemoveFavoriteMutation,
+} from "@/features/favorite/queries/favorite-query";
+import {
+  useWatchStatusQuery,
+  useWatchPageMutation,
+  useUnwatchPageMutation,
+} from "@/features/page/queries/watcher-query";
 
 interface PageHeaderMenuProps {
   readOnly?: boolean;
@@ -51,7 +65,6 @@ interface PageHeaderMenuProps {
 export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
   const { t } = useTranslation();
   const toggleAside = useToggleAside();
-  const [yjsConnectionStatus] = useAtom(yjsConnectionStatusAtom);
 
   useHotkeys(
     [
@@ -68,6 +81,7 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
           const event = new CustomEvent("closeFindDialogFromEditor", {});
           document.dispatchEvent(event);
         },
+        { preventDefault: false },
       ],
     ],
     [],
@@ -75,26 +89,17 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
 
   return (
     <>
-      {yjsConnectionStatus === "disconnected" && (
-        <Tooltip
-          label={t("Real-time editor connection lost. Retrying...")}
-          openDelay={250}
-          withArrow
-        >
-          <ActionIcon variant="default" c="red" style={{ border: "none" }}>
-            <IconWifiOff size={20} stroke={2} />
-          </ActionIcon>
-        </Tooltip>
-      )}
+      <ConnectionWarning />
 
       {!readOnly && <PageStateSegmentedControl size="xs" />}
 
-      <ShareModal readOnly={readOnly} />
+      <PageShareModal readOnly={readOnly} />
 
       <Tooltip label={t("Comments")} openDelay={250} withArrow>
         <ActionIcon
-          variant="default"
-          style={{ border: "none" }}
+          variant="subtle"
+          color="dark"
+          aria-label={t("Comments")}
           onClick={() => toggleAside("comments")}
         >
           <IconMessage size={20} stroke={2} />
@@ -103,8 +108,9 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
 
       <Tooltip label={t("Table of contents")} openDelay={250} withArrow>
         <ActionIcon
-          variant="default"
-          style={{ border: "none" }}
+          variant="subtle"
+          color="dark"
+          aria-label={t("Table of contents")}
           onClick={() => toggleAside("toc")}
         >
           <IconList size={20} stroke={2} />
@@ -135,8 +141,19 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
     movePageModalOpened,
     { open: openMovePageModal, close: closeMoveSpaceModal },
   ] = useDisclosure(false);
+  const [
+    verificationOpened,
+    { open: openVerificationModal, close: closeVerificationModal },
+  ] = useDisclosure(false);
   const [pageEditor] = useAtom(pageEditorAtom);
   const pageUpdatedAt = useTimeAgo(page?.updatedAt);
+  const favoriteIds = useFavoriteIds("page", page?.spaceId);
+  const addFavoriteMutation = useAddFavoriteMutation();
+  const removeFavoriteMutation = useRemoveFavoriteMutation();
+  const isFavorited = page?.id ? favoriteIds.has(page.id) : false;
+  const { data: watchStatus } = useWatchStatusQuery(page?.id);
+  const watchPage = useWatchPageMutation();
+  const unwatchPage = useUnwatchPageMutation();
 
   const handleCopyLink = () => {
     const pageUrl =
@@ -144,6 +161,15 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
 
     clipboard.copy(pageUrl);
     notifications.show({ message: t("Link copied") });
+  };
+
+  const handleCopyAsMarkdown = () => {
+    if (!pageEditor) return;
+    const html = pageEditor.getHTML();
+    const markdown = htmlToMarkdown(html);
+    const title = page?.title ? `# ${page.title}\n\n` : "";
+    clipboard.copy(`${title}${markdown}`);
+    notifications.show({ message: t("Copied") });
   };
 
   const handlePrint = () => {
@@ -160,6 +186,16 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
     openDeleteModal({ onConfirm: () => tree?.delete(page.id) });
   };
 
+  const handleToggleFavorite = () => {
+    if (!page?.id) return;
+    const params = { type: "page" as const, pageId: page.id };
+    if (isFavorited) {
+      removeFavoriteMutation.mutate(params);
+    } else {
+      addFavoriteMutation.mutate(params);
+    }
+  };
+
   return (
     <>
       <Menu
@@ -171,7 +207,11 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
         arrowPosition="center"
       >
         <Menu.Target>
-          <ActionIcon variant="default" style={{ border: "none" }}>
+          <ActionIcon
+            variant="subtle"
+            color="dark"
+            aria-label={t("Page actions")}
+          >
             <IconDots size={20} />
           </ActionIcon>
         </Menu.Target>
@@ -183,6 +223,43 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
           >
             {t("Copy link")}
           </Menu.Item>
+
+          <Menu.Item
+            leftSection={<IconMarkdown size={16} />}
+            onClick={handleCopyAsMarkdown}
+          >
+            {t("Copy as Markdown")}
+          </Menu.Item>
+
+          <Menu.Item
+            leftSection={
+              isFavorited ? (
+                <IconStarFilled size={16} color="var(--mantine-color-yellow-5)" />
+              ) : (
+                <IconStar size={16} />
+              )
+            }
+            onClick={handleToggleFavorite}
+          >
+            {isFavorited ? t("Remove from favorites") : t("Add to favorites")}
+          </Menu.Item>
+
+          {watchStatus?.watching ? (
+            <Menu.Item
+              leftSection={<IconEyeOff size={16} />}
+              onClick={() => unwatchPage.mutate(page.id)}
+            >
+              {t("Stop watching")}
+            </Menu.Item>
+          ) : (
+            <Menu.Item
+              leftSection={<IconEye size={16} />}
+              onClick={() => watchPage.mutate(page.id)}
+            >
+              {t("Watch page")}
+            </Menu.Item>
+          )}
+
           <Menu.Divider />
 
           <Menu.Item leftSection={<IconArrowsHorizontal size={16} />}>
@@ -197,6 +274,13 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
           >
             {t("Page history")}
           </Menu.Item>
+
+          {!readOnly && (
+            <PageVerificationMenuItem
+              pageId={page?.id}
+              onClick={openVerificationModal}
+            />
+          )}
 
           <Menu.Divider />
 
@@ -287,6 +371,66 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
         onClose={closeMoveSpaceModal}
         open={movePageModalOpened}
       />
+
+      <PageVerificationModal
+        pageId={page.id}
+        opened={verificationOpened}
+        onClose={closeVerificationModal}
+      />
     </>
+  );
+}
+
+function ConnectionWarning() {
+  const { t } = useTranslation();
+  const yjsConnectionStatus = useAtomValue(yjsConnectionStatusAtom);
+  const [showWarning, setShowWarning] = useState(false);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const isDisconnected = ["disconnected", "connecting"].includes(
+      yjsConnectionStatus,
+    );
+
+    if (isDisconnected) {
+      if (!timeoutRef.current) {
+        timeoutRef.current = setTimeout(() => setShowWarning(true), 5000);
+      }
+    } else {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      setShowWarning(false);
+    }
+  }, [yjsConnectionStatus]);
+
+  // Cleanup only on unmount
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  if (!showWarning) return null;
+
+  return (
+    <Tooltip
+      label={t("Real-time editor connection lost. Retrying...")}
+      openDelay={250}
+      withArrow
+    >
+      <ThemeIcon
+        variant="default"
+        c="red"
+        role="status"
+        aria-label={t("Real-time editor connection lost. Retrying...")}
+        style={{ border: "none" }}
+      >
+        <IconWifiOff size={20} stroke={2} />
+      </ThemeIcon>
+    </Tooltip>
   );
 }

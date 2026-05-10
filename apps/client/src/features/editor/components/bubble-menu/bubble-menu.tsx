@@ -1,10 +1,6 @@
-import {
-  BubbleMenu,
-  BubbleMenuProps,
-  isNodeSelection,
-  useEditor,
-  useEditorState,
-} from "@tiptap/react";
+import { BubbleMenu, BubbleMenuProps } from "@tiptap/react/menus";
+import { isNodeSelection, useEditorState } from "@tiptap/react";
+import type { Editor } from "@tiptap/react";
 import { FC, useEffect, useRef, useState } from "react";
 import {
   IconBold,
@@ -13,10 +9,11 @@ import {
   IconStrikethrough,
   IconUnderline,
   IconMessage,
+  IconSparkles,
 } from "@tabler/icons-react";
 import clsx from "clsx";
 import classes from "./bubble-menu.module.css";
-import { ActionIcon, rem, Tooltip } from "@mantine/core";
+import { ActionIcon, Button, rem, Tooltip } from "@mantine/core";
 import { ColorSelector } from "./color-selector";
 import { NodeSelector } from "./node-selector";
 import { TextAlignmentSelector } from "./text-alignment-selector";
@@ -24,11 +21,13 @@ import {
   draftCommentIdAtom,
   showCommentPopupAtom,
 } from "@/features/comment/atoms/comment-atom";
-import { useAtom } from "jotai";
+import { useAtom, useAtomValue } from "jotai";
 import { v7 as uuid7 } from "uuid";
 import { isCellSelection, isTextSelected } from "@docmost/editor-ext";
 import { LinkSelector } from "@/features/editor/components/bubble-menu/link-selector.tsx";
 import { useTranslation } from "react-i18next";
+import { showAiMenuAtom, showLinkMenuAtom } from "@/features/editor/atoms/editor-atoms";
+import { userAtom, workspaceAtom } from "@/features/user/atoms/current-user-atom";
 
 export interface BubbleMenuItem {
   name: string;
@@ -38,18 +37,35 @@ export interface BubbleMenuItem {
 }
 
 type EditorBubbleMenuProps = Omit<BubbleMenuProps, "children" | "editor"> & {
-  editor: ReturnType<typeof useEditor>;
+  editor: Editor | null;
 };
 
 export const EditorBubbleMenu: FC<EditorBubbleMenuProps> = (props) => {
   const { t } = useTranslation();
+  const [showAiMenu, setShowAiMenu] = useAtom(showAiMenuAtom);
   const [showCommentPopup, setShowCommentPopup] = useAtom(showCommentPopupAtom);
+  const workspace = useAtomValue(workspaceAtom);
+  const isGenerativeAiEnabled = workspace?.settings?.ai?.generative === true;
+  const user = useAtomValue(userAtom);
+  const editorToolbarEnabled =
+    user?.settings?.preferences?.editorToolbar ?? false;
   const [, setDraftCommentId] = useAtom(draftCommentIdAtom);
   const showCommentPopupRef = useRef(showCommentPopup);
+  const showAiMenuRef = useRef(showAiMenu);
+  const [showLinkMenu] = useAtom(showLinkMenuAtom);
+  const showLinkMenuRef = useRef(showLinkMenu);
 
   useEffect(() => {
     showCommentPopupRef.current = showCommentPopup;
   }, [showCommentPopup]);
+
+  useEffect(() => {
+    showAiMenuRef.current = showAiMenu;
+  }, [showAiMenu]);
+
+  useEffect(() => {
+    showLinkMenuRef.current = showLinkMenu;
+  }, [showLinkMenu]);
 
   const editorState = useEditorState({
     editor: props.editor,
@@ -127,24 +143,20 @@ export const EditorBubbleMenu: FC<EditorBubbleMenuProps> = (props) => {
         empty ||
         isNodeSelection(selection) ||
         isCellSelection(selection) ||
+        showAiMenuRef.current ||
+        showLinkMenuRef.current ||
         showCommentPopupRef?.current
       ) {
         return false;
       }
       return isTextSelected(editor);
     },
-    tippyOptions: {
-      moveTransition: "transform 0.15s ease-out",
-      onCreate: (instance) => {
-        instance.popper.firstChild?.addEventListener("blur", (event) => {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-        });
-      },
+    options: {
+      placement: editorToolbarEnabled ? "bottom" : "top",
+      offset: 8,
       onHide: () => {
         setIsNodeSelectorOpen(false);
         setIsTextAlignmentOpen(false);
-        setIsLinkSelectorOpen(false);
         setIsColorSelectorOpen(false);
       },
     },
@@ -152,85 +164,100 @@ export const EditorBubbleMenu: FC<EditorBubbleMenuProps> = (props) => {
 
   const [isNodeSelectorOpen, setIsNodeSelectorOpen] = useState(false);
   const [isTextAlignmentSelectorOpen, setIsTextAlignmentOpen] = useState(false);
-  const [isLinkSelectorOpen, setIsLinkSelectorOpen] = useState(false);
   const [isColorSelectorOpen, setIsColorSelectorOpen] = useState(false);
 
+  // Hide the bubble menu immediately when AI menu is shown
+  if (showAiMenu || showLinkMenu) return;
+
   return (
-    <BubbleMenu {...bubbleMenuProps}>
+    <BubbleMenu
+      {...bubbleMenuProps}
+      style={{ zIndex: 199, position: "relative" }}
+    >
       <div className={classes.bubbleMenu}>
-        <NodeSelector
-          editor={props.editor}
-          isOpen={isNodeSelectorOpen}
-          setIsOpen={() => {
-            setIsNodeSelectorOpen(!isNodeSelectorOpen);
-            setIsTextAlignmentOpen(false);
-            setIsLinkSelectorOpen(false);
-            setIsColorSelectorOpen(false);
-          }}
-        />
+        {isGenerativeAiEnabled && (
+          <>
+            <Button
+              variant="default"
+              className={clsx(classes.buttonRoot)}
+              radius="0"
+              leftSection={<IconSparkles size={16} />}
+              onClick={() => {
+                setShowAiMenu(true);
+              }}
+            >
+              {t("Ask AI")}
+            </Button>
+            <div className={classes.divider} />
+          </>
+        )}
+        {!editorToolbarEnabled && (
+          <>
+            <NodeSelector
+              editor={props.editor}
+              isOpen={isNodeSelectorOpen}
+              setIsOpen={() => {
+                setIsNodeSelectorOpen(!isNodeSelectorOpen);
+                setIsTextAlignmentOpen(false);
+                setIsColorSelectorOpen(false);
+              }}
+            />
 
-        <TextAlignmentSelector
-          editor={props.editor}
-          isOpen={isTextAlignmentSelectorOpen}
-          setIsOpen={() => {
-            setIsTextAlignmentOpen(!isTextAlignmentSelectorOpen);
-            setIsNodeSelectorOpen(false);
-            setIsLinkSelectorOpen(false);
-            setIsColorSelectorOpen(false);
-          }}
-        />
+            <TextAlignmentSelector
+              editor={props.editor}
+              isOpen={isTextAlignmentSelectorOpen}
+              setIsOpen={() => {
+                setIsTextAlignmentOpen(!isTextAlignmentSelectorOpen);
+                setIsNodeSelectorOpen(false);
+                setIsColorSelectorOpen(false);
+              }}
+            />
 
-        <ActionIcon.Group>
-          {items.map((item, index) => (
-            <Tooltip key={index} label={t(item.name)} withArrow>
-              <ActionIcon
-                key={index}
-                variant="default"
-                size="lg"
-                radius="0"
-                aria-label={t(item.name)}
-                className={clsx({ [classes.active]: item.isActive() })}
-                style={{ border: "none" }}
-                onClick={item.command}
-              >
-                <item.icon style={{ width: rem(16) }} stroke={2} />
-              </ActionIcon>
-            </Tooltip>
-          ))}
-        </ActionIcon.Group>
+            <ActionIcon.Group>
+              {items.map((item, index) => (
+                <Tooltip key={index} label={t(item.name)} withArrow>
+                  <ActionIcon
+                    key={index}
+                    variant="default"
+                    size="lg"
+                    radius="0"
+                    aria-label={t(item.name)}
+                    className={clsx({ [classes.active]: item.isActive() })}
+                    style={{ border: "none" }}
+                    onClick={item.command}
+                  >
+                    <item.icon style={{ width: rem(16) }} stroke={2} />
+                  </ActionIcon>
+                </Tooltip>
+              ))}
+            </ActionIcon.Group>
 
-        <LinkSelector
-          editor={props.editor}
-          isOpen={isLinkSelectorOpen}
-          setIsOpen={(value) => {
-            setIsLinkSelectorOpen(value);
-            setIsNodeSelectorOpen(false);
-            setIsTextAlignmentOpen(false);
-            setIsColorSelectorOpen(false);
-          }}
-        />
+            <LinkSelector />
 
-        <ColorSelector
-          editor={props.editor}
-          isOpen={isColorSelectorOpen}
-          setIsOpen={() => {
-            setIsColorSelectorOpen(!isColorSelectorOpen);
-            setIsNodeSelectorOpen(false);
-            setIsTextAlignmentOpen(false);
-            setIsLinkSelectorOpen(false);
-          }}
-        />
+            <ColorSelector
+              editor={props.editor}
+              isOpen={isColorSelectorOpen}
+              setIsOpen={() => {
+                setIsColorSelectorOpen(!isColorSelectorOpen);
+                setIsNodeSelectorOpen(false);
+                setIsTextAlignmentOpen(false);
+              }}
+            />
+          </>
+        )}
 
-        <ActionIcon
-          variant="default"
-          size="lg"
-          radius="0"
-          aria-label={t(commentItem.name)}
-          style={{ border: "none" }}
-          onClick={commentItem.command}
-        >
-          <IconMessage size={16} stroke={2} />
-        </ActionIcon>
+        <Tooltip label={t(commentItem.name)} withArrow withinPortal={false}>
+          <ActionIcon
+            variant="default"
+            size="lg"
+            radius="6px"
+            aria-label={t(commentItem.name)}
+            style={{ border: "none" }}
+            onClick={commentItem.command}
+          >
+            <IconMessage size={16} stroke={2} />
+          </ActionIcon>
+        </Tooltip>
       </div>
     </BubbleMenu>
   );

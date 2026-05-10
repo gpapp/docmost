@@ -5,16 +5,17 @@ import { getAppName } from "@/lib/config";
 import { useGetSpacesQuery } from "@/features/space/queries/space-query";
 import CreateSpaceModal from "@/features/space/components/create-space-modal";
 import { AllSpacesList } from "@/features/space/components/spaces-page";
+import FavoriteSpacesGrid from "@/features/space/components/spaces-page/favorite-spaces-grid";
 import { usePaginateAndSearch } from "@/hooks/use-paginate-and-search";
 import useUserRole from "@/hooks/use-user-role";
 
 export default function Spaces() {
   const { t } = useTranslation();
   const { isAdmin } = useUserRole();
-  const { search, page, setPage, handleSearch } = usePaginateAndSearch();
+  const { search, cursor, goNext, goPrev, handleSearch } = usePaginateAndSearch();
 
   const { data, isLoading } = useGetSpacesQuery({
-    page,
+    cursor,
     limit: 30,
     query: search,
   });
@@ -33,18 +34,20 @@ export default function Spaces() {
           {isAdmin && <CreateSpaceModal />}
         </Group>
 
+        <FavoriteSpacesGrid />
+
         <Box>
           <Text size="sm" c="dimmed" mb="md">
-            {t("Spaces you belong to")}
+            {t("All spaces")}
           </Text>
 
           <AllSpacesList
             spaces={data?.items || []}
             onSearch={handleSearch}
-            page={page}
             hasPrevPage={data?.meta?.hasPrevPage}
             hasNextPage={data?.meta?.hasNextPage}
-            onPageChange={setPage}
+            onNext={() => goNext(data?.meta?.nextCursor)}
+            onPrev={goPrev}
           />
         </Box>
       </Container>

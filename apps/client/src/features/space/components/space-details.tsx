@@ -19,6 +19,7 @@ import {
   ResponsiveSettingsRow,
 } from "@/components/ui/responsive-settings-row.tsx";
 
+
 interface SpaceDetailsProps {
   spaceId: string;
   readOnly?: boolean;
@@ -77,7 +78,6 @@ export default function SpaceDetails({ spaceId, readOnly }: SpaceDetailsProps) {
               fallbackName={space.name}
               size={"60px"}
               variant="filled"
-
               type={AvatarIconType.SPACE_ICON}
               onUpload={handleIconUpload}
               onRemove={handleIconRemove}
