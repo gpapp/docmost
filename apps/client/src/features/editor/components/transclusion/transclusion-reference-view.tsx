@@ -35,6 +35,7 @@ export default function TransclusionReferenceView(props: NodeViewProps) {
   return (
     <NodeViewWrapper
       className={classes.includeWrap}
+      data-editable={isEditable ? "true" : "false"}
       data-focused={isEditable && props.selected ? "true" : "false"}
       data-menu-open={openMenus > 0 ? "true" : "false"}
       contentEditable={false}
@@ -104,6 +105,7 @@ function TransclusionReferenceBody({
         sourcePageId,
         transclusionId,
       });
+      if (editor.isDestroyed) return;
       const pos = getPos();
       if (typeof pos !== "number") return;
       const from = pos;

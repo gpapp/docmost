@@ -38,6 +38,7 @@ export class PageRepo {
     'spaceId',
     'workspaceId',
     'isLocked',
+    'isBase',
     'createdAt',
     'updatedAt',
     'deletedAt',
@@ -54,6 +55,7 @@ export class PageRepo {
       includeCreator?: boolean;
       includeLastUpdatedBy?: boolean;
       includeContributors?: boolean;
+      includeDeletedBy?: boolean;
       includeHasChildren?: boolean;
       withLock?: boolean;
       trx?: KyselyTransaction;
@@ -81,6 +83,10 @@ export class PageRepo {
 
     if (opts?.includeContributors) {
       query = query.select((eb) => this.withContributors(eb));
+    }
+
+    if (opts?.includeDeletedBy) {
+      query = query.select((eb) => this.withDeletedBy(eb));
     }
 
     if (opts?.includeSpace) {

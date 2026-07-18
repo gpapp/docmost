@@ -14,6 +14,7 @@ import {
   WebSocketStatus,
   HocuspocusProviderWebsocket,
   onSyncedParameters,
+  onStatelessParameters,
 } from "@hocuspocus/provider";
 import {
   Editor,
@@ -26,12 +27,14 @@ import {
   collabExtensions,
   mainExtensions,
 } from "@/features/editor/extensions/extensions";
-import { useAtom } from "jotai";
+import { useAtom, useAtomValue } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
+  currentPageEditModeAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
+  yjsSyncedAtom,
 } from "@/features/editor/atoms/editor-atoms";
 import { asideStateAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom";
 import {
@@ -42,8 +45,8 @@ import {
 import CommentDialog from "@/features/comment/components/comment-dialog";
 import { EditorBubbleMenu } from "@/features/editor/components/bubble-menu/bubble-menu";
 import { ReadonlyBubbleMenu } from "@/features/editor/components/bubble-menu/readonly-bubble-menu";
-import TableCellMenu from "@/features/editor/components/table/table-cell-menu.tsx";
 import TableMenu from "@/features/editor/components/table/table-menu.tsx";
+import { TableHandlesLayer } from "@/features/editor/components/table/handle/table-handles-layer";
 import ImageMenu from "@/features/editor/components/image/image-menu.tsx";
 import CalloutMenu from "@/features/editor/components/callout/callout-menu.tsx";
 import VideoMenu from "@/features/editor/components/video/video-menu.tsx";
@@ -54,7 +57,8 @@ import {
   handlePaste,
 } from "@/features/editor/components/common/editor-paste-handler.tsx";
 import EmbedMenu from "@/features/editor/components/embed/embed-menu.tsx";
-import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu";
+import TableCellMenu from "@/features/editor/components/table/table-cell-menu.tsx";
+import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu-lazy";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
@@ -73,6 +77,7 @@ import { EditorAiMenu } from "@/ee/ai/components/editor/ai-menu/ai-menu";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
+import { useTranslation } from "react-i18next";
 
 interface PageEditorProps {
   pageId: string;
@@ -87,6 +92,7 @@ export default function PageEditor({
   content,
   canComment,
 }: PageEditorProps) {
+  const { t } = useTranslation();
   const collaborationURL = useCollaborationUrl();
   const isComponentMounted = useRef(false);
   const editorRef = useRef<Editor | null>(null);
@@ -106,14 +112,14 @@ export default function PageEditor({
   const [yjsConnectionStatus, setYjsConnectionStatus] = useAtom(
     yjsConnectionStatusAtom,
   );
+  const [, setYjsSynced] = useAtom(yjsSyncedAtom);
   const menuContainerRef = useRef(null);
   const { data: collabQuery, refetch: refetchCollabToken } = useCollabToken();
   const { isIdle, resetIdle } = useIdle(FIVE_MINUTES, { initialState: false });
   const documentState = useDocumentVisibility();
   const { pageSlug } = useParams();
   const slugId = extractPageSlugId(pageSlug);
-  const userPageEditMode =
-    currentUser?.user?.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
+  const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
   const canScroll = useCallback(
     () => Boolean(isComponentMounted.current && editorRef.current),
     [isComponentMounted],
@@ -144,6 +150,24 @@ export default function PageEditor({
       const onSyncedHandler = (event: onSyncedParameters) => {
         setIsRemoteSynced(event.state);
       };
+      const onStatelessHandler = ({ payload }: onStatelessParameters) => {
+        try {
+          const message = JSON.parse(payload);
+          if (message?.type !== "page.updated" || !message.updatedAt) return;
+          const pageData = queryClient.getQueryData<IPage>(["pages", slugId]);
+          if (pageData) {
+            queryClient.setQueryData(["pages", slugId], {
+              ...pageData,
+              updatedAt: message.updatedAt,
+              ...(message.lastUpdatedBy && {
+                lastUpdatedBy: message.lastUpdatedBy,
+              }),
+            });
+          }
+        } catch {
+          // ignore unrelated stateless messages
+        }
+      };
       const onAuthenticationFailedHandler = () => {
         const payload = jwtDecode(collabQuery?.token);
         const now = Date.now().valueOf() / 1000;
@@ -168,6 +192,7 @@ export default function PageEditor({
         onAuthenticationFailed: onAuthenticationFailedHandler,
         onStatus: onStatusHandler,
         onSynced: onSyncedHandler,
+        onStateless: onStatelessHandler,
       });
 
       local.on("synced", onLocalSyncedHandler);
@@ -232,19 +257,14 @@ export default function PageEditor({
       editorProps: {
         scrollThreshold: 80,
         scrollMargin: 80,
+        attributes: {
+          "aria-label": t("Page content"),
+        },
         handleDOMEvents: {
           keydown: (_view, event) => {
             if (platformModifierKey(event) && event.code === "KeyS") {
               event.preventDefault();
               return true;
-            }
-            if (event.key === "Tab") {
-                const editor = editorRef.current;
-                if (!editor) return false;
-                event.preventDefault();
-                return editor.view.someProp("handleKeyDown", (f) =>
-                  f(editor.view, event)
-                );
             }
             if (platformModifierKey(event) && event.code === "KeyK") {
               searchSpotlight.open();
@@ -322,7 +342,6 @@ export default function PageEditor({
       queryClient.setQueryData(["pages", slugId], {
         ...pageData,
         content: newContent,
-        updatedAt: new Date(),
       });
     }
   }, 3000);
@@ -364,6 +383,14 @@ export default function PageEditor({
   const isSynced = isLocalSynced && isRemoteSynced;
 
   useEffect(() => {
+    setYjsSynced(isSynced);
+  }, [isSynced, setYjsSynced]);
+
+  useEffect(() => {
+    return () => setYjsSynced(false);
+  }, [setYjsSynced]);
+
+  useEffect(() => {
     const timeout = setTimeout(() => {
       if (yjsConnectionStatus === WebSocketStatus.Connecting || !isSynced) {
         setYjsConnectionStatus(WebSocketStatus.Disconnected);
@@ -373,19 +400,9 @@ export default function PageEditor({
     return () => clearTimeout(timeout);
   }, [yjsConnectionStatus, isSynced]);
   useEffect(() => {
-    // Only honor user default page edit mode preference and permissions
-    if (editor) {
-      if (userPageEditMode && editable) {
-        if (userPageEditMode === PageEditMode.Edit) {
-          editor.setEditable(true);
-        } else if (userPageEditMode === PageEditMode.Read) {
-          editor.setEditable(false);
-        }
-      } else {
-        editor.setEditable(false);
-      }
-    }
-  }, [userPageEditMode, editor, editable]);
+    if (!editor) return;
+    editor.setEditable(editable && currentPageEditMode === PageEditMode.Edit);
+  }, [currentPageEditMode, editor, editable]);
 
   const hasConnectedOnceRef = useRef(false);
   const [showStatic, setShowStatic] = useState(true);
@@ -409,6 +426,11 @@ export default function PageEditor({
           immediatelyRender={true}
           extensions={mainExtensions}
           content={content}
+          editorProps={{
+            attributes: {
+              "aria-label": t("Page content"),
+            },
+          }}
         />
       ) : (
         <div className="editor-container" style={{ position: "relative" }}>
@@ -419,39 +441,40 @@ export default function PageEditor({
               <SearchAndReplaceDialog editor={editor} editable={editable} />
             )}
 
-{editor && editorIsEditable && (
-          <div>
-            <EditorAiMenu editor={editor} />
-            <EditorLinkMenu editor={editor} />
-            <EditorBubbleMenu editor={editor} />
-            <TableMenu editor={editor} />
-            <TableCellMenu editor={editor} appendTo={menuContainerRef} />
-            <ImageMenu editor={editor} />
-            <VideoMenu editor={editor} />
-            <PdfMenu editor={editor} />
-            <CalloutMenu editor={editor} />
-            <SubpagesMenu editor={editor} />
-            <EmbedMenu editor={editor} />
-            <ExcalidrawMenu editor={editor} />
-            <DrawioMenu editor={editor} />
-            <ColumnsMenu editor={editor} />
-          </div>
-        )}
-        {editor &&
-          !editorIsEditable &&
-          (editable || canComment) &&
-          providersRef.current && (
-            <ReadonlyBubbleMenu editor={editor} />
-          )}
-        {showCommentPopup && (
-          <CommentDialog editor={editor} pageId={pageId} />
-        )}
-        {showReadOnlyCommentPopup && (
-          <CommentDialog editor={editor} pageId={pageId} readOnly />
-        )}
+            {editor && editorIsEditable && (
+              <div>
+                <EditorAiMenu editor={editor} />
+                <EditorLinkMenu editor={editor} />
+                <EditorBubbleMenu editor={editor} />
+                <TableMenu editor={editor} />
+                <TableCellMenu editor={editor} appendTo={menuContainerRef} />
+                <TableHandlesLayer editor={editor} />
+                <ImageMenu editor={editor} />
+                <VideoMenu editor={editor} />
+                <PdfMenu editor={editor} />
+                <CalloutMenu editor={editor} />
+                <SubpagesMenu editor={editor} />
+                <EmbedMenu editor={editor} />
+                <ExcalidrawMenu editor={editor} />
+                <DrawioMenu editor={editor} />
+                <ColumnsMenu editor={editor} />
+              </div>
+            )}
+            {editor &&
+              !editorIsEditable &&
+              (editable || canComment) &&
+              providersRef.current && <ReadonlyBubbleMenu editor={editor} />}
+            {showCommentPopup && (
+              <CommentDialog editor={editor} pageId={pageId} />
+            )}
+            {showReadOnlyCommentPopup && (
+              <CommentDialog editor={editor} pageId={pageId} readOnly />
+            )}
           </div>
           <div
-            onClick={() => editor.commands.focus("end")}
+            onClick={() => {
+              if (editor && !editor.isDestroyed) editor.commands.focus("end");
+            }}
             style={{ paddingBottom: "20vh" }}
           ></div>
         </div>

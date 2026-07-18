@@ -26,6 +26,7 @@ import {
   TiptapVideo,
   TiptapAudio,
   TiptapPdf,
+  PageBreak,
   TrailingNode,
   Attachment,
   Drawio,
@@ -43,6 +44,7 @@ import {
   htmlToMarkdown,
   TransclusionSource,
   TransclusionReference,
+  BaseEmbed,
 } from '@docmost/editor-ext';
 import { generateText, getSchema, JSONContent } from '@tiptap/core';
 import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
@@ -94,6 +96,7 @@ export const tiptapExtensions = [
   TiptapVideo,
   TiptapAudio,
   TiptapPdf,
+  PageBreak,
   Callout,
   Attachment,
   CustomCodeBlock,
@@ -107,6 +110,7 @@ export const tiptapExtensions = [
   Status,
   TransclusionSource,
   TransclusionReference,
+  BaseEmbed
 ] as any;
 
 export function jsonToHtml(tiptapJson: any) {

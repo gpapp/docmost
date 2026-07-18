@@ -39,6 +39,7 @@ import UserApiKeys from "@/ee/api-key/pages/user-api-keys";
 import WorkspaceApiKeys from "@/ee/api-key/pages/workspace-api-keys";
 import AiSettings from "@/ee/ai/pages/ai-settings.tsx";
 import ShareTarget from "@/pages/share-target/share-target.tsx";
+import BasePage from "@/ee/base/pages/base-page.tsx";
 import AuditLogs from "@/ee/audit/pages/audit-logs.tsx";
 import VerifiedPages from "@/ee/page-verification/pages/verified-pages.tsx";
 import TemplateList from "@/ee/template/pages/template-list";
@@ -108,6 +109,8 @@ export default function App() {
             path={"/s/:spaceSlug/p/:pageSlug"}
             element={<Page />}
           />
+
+          <Route path={"/base/:pageId"} element={<BasePage />} />
 
           <Route path={"/settings"}>
             <Route path={"account/profile"} element={<AccountSettings />} />

@@ -34,6 +34,8 @@ export interface GlobalDragHandleOptions {
    * Custom nodes to be included for drag handle
    */
   customNodes: string[];
+
+  atomNodes: string[];
 }
 function absoluteRect(node: Element) {
   const data = node.getBoundingClientRect();
@@ -60,6 +62,27 @@ function nodeDOMAtCoords(
   options: GlobalDragHandleOptions,
   view: EditorView,
 ) {
+  // Custom nodes (transclusion, …) render via tiptap's React node-view
+  // renderer, which emits `class="react-renderer node-${name}"` on the
+  // live wrapper — the `data-type` attribute is for static HTML
+  // serialization only. Match both so we cover live and parsed DOM.
+  // Inside a custom node, also match plain `p` so the first paragraph
+  // (which doesn't match `:not(:first-child)`) still gets its own
+  // handle; only hovers on the custom node's padding/border fall
+  // through to the wrapper.
+  const customSelectors = options.customNodes.flatMap((node) => [
+    `[data-type=${node}]`,
+    `.node-${node}`,
+  ]);
+  const customParagraphSelectors = options.customNodes.flatMap((node) => [
+    `[data-type=${node}] p`,
+    `.node-${node} p`,
+  ]);
+  const atomSelectors = options.atomNodes.flatMap((node) => [
+    `[data-type=${node}]`,
+    `.node-${node}`,
+  ]);
+
   const selectors = [
     "li",
     "p:not(:first-child)",
@@ -71,9 +94,16 @@ function nodeDOMAtCoords(
     "h4",
     "h5",
     "h6",
-    ...options.customNodes.map((node) => `[data-type=${node}]`),
+    // Tables nested in another block (toggle, transclusion, …) have a
+    // wrapper that isn't a direct child of .ProseMirror, so the
+    // parent-check below skips it. Match the wrapper explicitly so the
+    // handle shows up even with empty cells.
+    ".tableWrapper",
+    ...customParagraphSelectors,
+    ...customSelectors,
+    ...atomSelectors,
   ].join(", ");
-  return document
+  const found = document
     .elementsFromPoint(coords.x, coords.y)
     .find((elem: Element) => {
       // Skip elements that belong to a nested editor (e.g. transclusion
@@ -85,6 +115,11 @@ function nodeDOMAtCoords(
         elem.matches(selectors)
       );
     });
+  if (found && atomSelectors.length > 0) {
+    const atomWrapper = found.closest(atomSelectors.join(", "));
+    if (atomWrapper) return atomWrapper;
+  }
+  return found;
 }
 function nodePosAtDOM(
   node: Element,
@@ -97,6 +132,22 @@ function nodePosAtDOM(
     left: boundingRect.left + 50 + options.dragHandleWidth,
     top: boundingRect.top + 1,
   })?.inside;
+}
+
+function isCustomNodeDOM(
+  elem: Element | null | undefined,
+  options: GlobalDragHandleOptions,
+): boolean {
+  if (!elem) return false;
+  for (const name of [...options.customNodes, ...options.atomNodes]) {
+    if (
+      elem.getAttribute("data-type") === name ||
+      elem.classList.contains(`node-${name}`)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function calcNodePos(pos: number, view: EditorView) {
@@ -137,7 +188,6 @@ export function DragHandlePlugin(
 
     const nodePos = view.state.doc.resolve(fromSelectionPos);
 
-    // Check if nodePos points to the top level node
     if (nodePos.node().type.name === "doc") differentNodeSelected = true;
     else {
       const nodeSelection = NodeSelection.create(
@@ -166,14 +216,49 @@ export function DragHandlePlugin(
     } else {
       selection = NodeSelection.create(view.state.doc, draggedNodePos);
 
-      // if inline node is selected, e.g mention -> go to the parent node to select the whole node
-      // if table row is selected, go to the parent node to select the whole node
-      if (
-        (selection as NodeSelection).node.type.isInline ||
-        (selection as NodeSelection).node.type.name === "tableRow"
-      ) {
-        let $pos = view.state.doc.resolve(selection.from);
-        selection = NodeSelection.create(view.state.doc, $pos.before());
+      const $sel = view.state.doc.resolve(selection.from);
+
+      if (isCustomNodeDOM(node, options)) {
+        // The drag landed on a custom-node container (transclusion etc.).
+        // Walk up to the matching node so the drag moves the whole
+        // container, not whatever inner element the click landed on.
+        const customTypes = new Set([
+          ...options.customNodes,
+          ...options.atomNodes,
+        ]);
+        for (let d = $sel.depth; d > 0; d--) {
+          if (customTypes.has($sel.node(d).type.name)) {
+            selection = NodeSelection.create(
+              view.state.doc,
+              $sel.before(d),
+            );
+            break;
+          }
+        }
+      } else {
+        // If the selected node lives inside a table (at any nesting
+        // depth), promote to the whole table — the global drag handle is
+        // meant to move the table as a single block, not a row/cell. The
+        // earlier tableRow-only check only worked when the table sat at
+        // the doc root; once wrapped in another node (toggle, layout,
+        // etc.) the selection lands on a cell/paragraph and that check
+        // never fired.
+        let tableDepth = -1;
+        for (let d = $sel.depth; d > 0; d--) {
+          if ($sel.node(d).type.name === "table") {
+            tableDepth = d;
+            break;
+          }
+        }
+        if (tableDepth > 0) {
+          selection = NodeSelection.create(
+            view.state.doc,
+            $sel.before(tableDepth),
+          );
+        } else if ((selection as NodeSelection).node.type.isInline) {
+          // Inline node (e.g. mention): walk up to the parent block.
+          selection = NodeSelection.create(view.state.doc, $sel.before());
+        }
       }
     }
     view.dispatch(view.state.tr.setSelection(selection));
@@ -194,7 +279,23 @@ export function DragHandlePlugin(
     event.dataTransfer.setData("text/plain", text);
     event.dataTransfer.effectAllowed = "move";
 
-    event.dataTransfer.setDragImage(node, 0, 0);
+    const previewTemplate =
+      node.querySelector<HTMLElement>("[data-drag-preview]");
+    if (previewTemplate) {
+      const preview = previewTemplate.cloneNode(true) as HTMLElement;
+      preview.removeAttribute("hidden");
+      preview.style.position = "fixed";
+      preview.style.top = "0";
+      preview.style.left = "-10000px";
+      preview.style.pointerEvents = "none";
+      document.body.appendChild(preview);
+      event.dataTransfer.setDragImage(preview, 0, 0);
+      document.addEventListener("dragend", () => preview.remove(), {
+        once: true,
+      });
+    } else {
+      event.dataTransfer.setDragImage(node, 0, 0);
+    }
 
     view.dragging = { slice, move: event.ctrlKey };
   }
@@ -313,6 +414,27 @@ export function DragHandlePlugin(
             return;
           }
 
+          const isCustomNode = isCustomNodeDOM(node, options);
+
+          // Custom nodes pin the handle to the inner NodeViewWrapper's top-left:
+          // the natural anchor sits in transient/empty space outside the visible block.
+          if (isCustomNode) {
+            // tiptap React node-views emit an outer `.react-renderer` whose first
+            // child is the visible NodeViewWrapper; walk to that outer first since
+            // `node` may be either the outer or an inner element with data-type.
+            const rendererOuter =
+              (node.closest(".react-renderer") as HTMLElement | null) ?? node;
+            const inner =
+              (rendererOuter.firstElementChild as HTMLElement | null) ??
+              rendererOuter;
+            const innerRect = absoluteRect(inner);
+            if (!dragHandleElement) return;
+            dragHandleElement.style.left = `${innerRect.left + 4}px`;
+            dragHandleElement.style.top = `${innerRect.top + 4}px`;
+            showDragHandle();
+            return;
+          }
+
           const compStyle = window.getComputedStyle(node);
           const parsedLineHeight = parseInt(compStyle.lineHeight, 10);
           const lineHeight = isNaN(parsedLineHeight)
@@ -326,6 +448,13 @@ export function DragHandlePlugin(
           rect.top += paddingTop;
           // Li markers
           if (node.matches("ul:not([data-type=taskList]) li, ol li")) {
+            rect.left -= options.dragHandleWidth;
+          }
+          // Tables: clear the table's own row-drag handle so the two
+          // grips don't stack on each other. `nodeDOMAtCoords` returns
+          // the wrapper for top-level hovers (wrapper is direct child of
+          // .ProseMirror) and a descendant for deeper hovers — cover both.
+          if (node.closest(".tableWrapper")) {
             rect.left -= options.dragHandleWidth;
           }
           rect.width = options.dragHandleWidth;
@@ -399,6 +528,7 @@ const GlobalDragHandle = Extension.create({
       scrollThreshold: 100,
       excludedTags: [],
       customNodes: [],
+      atomNodes: [],
     };
   },
 
@@ -411,6 +541,7 @@ const GlobalDragHandle = Extension.create({
         dragHandleSelector: this.options.dragHandleSelector,
         excludedTags: this.options.excludedTags,
         customNodes: this.options.customNodes,
+        atomNodes: this.options.atomNodes,
       }),
     ];
   },
